@@ -119,8 +119,10 @@ async def get_clob_best_ask(token_id: str, client: httpx.AsyncClient) -> float |
         return None
 
     try:
-        # asks are sorted ascending by price — first entry is best (lowest) ask
-        best_ask = float(asks[0]["price"])
+        # asks are sorted DESCENDING (highest price first) — last entry is best (lowest) ask
+        best_ask = float(asks[-1]["price"])
+        log.debug("CLOB best ask for token_id=%s: %.4f (book range: %.4f–%.4f, %d levels)",
+                  token_id, best_ask, float(asks[-1]["price"]), float(asks[0]["price"]), len(asks))
         return best_ask
     except (KeyError, ValueError, IndexError):
         log.exception("Failed to parse CLOB asks for token_id=%s", token_id)
