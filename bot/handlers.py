@@ -40,6 +40,7 @@ from bot.keyboards import (
     download_keyboard,
     main_menu,
     pattern_filter_row,
+    pattern_keyboard,
     redeem_confirm_keyboard,
     redeem_done_keyboard,
     settings_keyboard,
@@ -353,7 +354,7 @@ async def cmd_download_excel(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def cmd_patterns(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     rows = await queries.get_pattern_stats()
     text = format_pattern_stats(rows)
-    kb = pattern_filter_row()
+    kb = pattern_keyboard()
     if update.callback_query:
         await update.callback_query.answer()
         await _safe_edit(update.callback_query, text, reply_markup=kb)
@@ -371,8 +372,8 @@ async def cmd_download_pattern_excel(update: Update, context: ContextTypes.DEFAU
     ws = wb.active
     ws.title = "Patterns"
     ws.append([
-        "pattern", "total_trades", "wins", "losses",
-        "win_pct", "wl_ratio", "total_deployed", "net_pnl", "roi_pct", "last_seen",
+        "Pattern", "Total Trades", "Wins", "Losses",
+        "Win%", "W/L Ratio", "Deployed USDC", "Net PnL", "ROI%", "Last Seen",
     ])
     for r in rows:
         ws.append([
@@ -386,7 +387,7 @@ async def cmd_download_pattern_excel(update: Update, context: ContextTypes.DEFAU
     buf.seek(0)
     await query.message.reply_document(
         document=buf,
-        filename="patterns.xlsx",
+        filename="pattern_performance.xlsx",
         caption="\U0001f4e5 Per-pattern stats export (Excel)",
     )
 
