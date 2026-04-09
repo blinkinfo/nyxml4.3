@@ -214,7 +214,12 @@ class MLStrategy(BaseStrategy):
             prob_down = round(1.0 - prob, 6)
 
             up_qualifies   = prob      >= up_threshold
-            down_qualifies = prob_down >= down_threshold
+            # DOWN uses the same bar as UP applied to prob_down — this creates
+            # a symmetric dead zone: skip if (1-up_threshold) < prob < up_threshold.
+            # Using down_threshold directly would widen the fire zone asymmetrically
+            # when down_threshold != up_threshold (e.g. from DB override).
+            # The stricter of the two is always used here: max(down_threshold, up_threshold).
+            down_qualifies = prob_down >= max(down_threshold, up_threshold)
 
             # Determine direction:
             #   - Both qualify  → pick the one with the larger margin over its threshold
