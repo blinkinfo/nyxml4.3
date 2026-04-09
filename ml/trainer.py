@@ -35,7 +35,7 @@ LGBM_PARAMS = {
     "reg_alpha": 0.1,
     "reg_lambda": 0.1,
     "verbose": -1,
-    "n_jobs": -1,
+    "n_jobs": 2,
 }
 
 NUM_BOOST_ROUND = 1000
@@ -209,7 +209,7 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
 
     callbacks = [
         lgb.early_stopping(EARLY_STOPPING_ROUNDS, verbose=False),
-        lgb.log_evaluation(period=-1),
+        lgb.log_evaluation(period=50),
     ]
 
     model = lgb.train(

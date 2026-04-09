@@ -924,35 +924,39 @@ async def cmd_set_threshold(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def cmd_model_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show current ML model status."""
     from ml import model_store
+    if update.callback_query:
+        await update.callback_query.answer()
+        send = update.callback_query.message.reply_text
+    else:
+        send = update.message.reply_text
     meta = model_store.load_metadata("current")
     if meta is None:
-        await update.message.reply_text(
-            "No model trained yet. Use /retrain to train one.", parse_mode="HTML"
-        )
+        await send("No model trained yet. Use /retrain to train one.", parse_mode="HTML")
         return
     threshold = await queries.get_ml_threshold()
     text = format_model_status("current", meta, threshold)
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=back_to_menu())
+    await send(text, parse_mode="HTML", reply_markup=back_to_menu())
 
 
 @auth_check
 async def cmd_model_compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Compare current vs candidate model."""
     from ml import model_store
+    if update.callback_query:
+        await update.callback_query.answer()
+        send = update.callback_query.message.reply_text
+    else:
+        send = update.message.reply_text
     current_meta = model_store.load_metadata("current")
     candidate_meta = model_store.load_metadata("candidate")
     if current_meta is None:
-        await update.message.reply_text(
-            "No current model. Use /retrain to train one.", parse_mode="HTML"
-        )
+        await send("No current model. Use /retrain to train one.", parse_mode="HTML")
         return
     if candidate_meta is None:
-        await update.message.reply_text(
-            "No candidate model. Use /retrain to generate a candidate.", parse_mode="HTML"
-        )
+        await send("No candidate model. Use /retrain to generate a candidate.", parse_mode="HTML")
         return
     text = format_model_compare(current_meta, candidate_meta)
-    await update.message.reply_text(text, parse_mode="HTML", reply_markup=back_to_menu())
+    await send(text, parse_mode="HTML", reply_markup=back_to_menu())
 
 
 @auth_check
@@ -960,17 +964,20 @@ async def cmd_promote_model(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     """Promote candidate model to current."""
     from ml import model_store
     from core.strategies.ml_strategy import request_model_reload
+    if update.callback_query:
+        await update.callback_query.answer()
+        send = update.callback_query.message.reply_text
+    else:
+        send = update.message.reply_text
     if not model_store.has_model("candidate"):
-        await update.message.reply_text(
-            "No candidate model to promote. Use /retrain first.", parse_mode="HTML"
-        )
+        await send("No candidate model to promote. Use /retrain first.", parse_mode="HTML")
         return
     model_store.promote_candidate()
     request_model_reload()
     meta = model_store.load_metadata("current")
     threshold = await queries.get_ml_threshold()
     text = format_model_status("current (promoted)", meta or {}, threshold)
-    await update.message.reply_text(
+    await send(
         f"{text}\n\nCandidate promoted to current. Model will reload on next signal check.",
         parse_mode="HTML",
     )
@@ -979,37 +986,69 @@ async def cmd_promote_model(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 @auth_check
 async def cmd_retrain(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Trigger async background retraining."""
-    await update.message.reply_text(format_retrain_started(), parse_mode="HTML")
-    asyncio.create_task(_retrain_background(update, context))
+    if update.callback_query:
+        await update.callback_query.answer()
+        send = update.callback_query.message.reply_text
+    else:
+        send = update.message.reply_text
+    await send("Retraining started... estimated time ~5-8 min. I'll notify you when done.", parse_mode="HTML")
+    asyncio.create_task(_retrain_background(context.application, cfg.TELEGRAM_CHAT_ID))
 
 
-async def _retrain_background(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Background retraining: fetch data, build features, train, report."""
+async def _retrain_background(application, chat_id) -> None:
+    """Background retraining: fetch data, build features, train, save to DB, report."""
     import asyncio as _asyncio
     from ml import data_fetcher, features as feat_eng, trainer, model_store
+
+    async def notify(text: str) -> None:
+        try:
+            await application.bot.send_message(
+                chat_id=int(chat_id), text=text, parse_mode="HTML"
+            )
+        except Exception as e:
+            log.warning("_retrain_background: failed to send notification: %s", e)
+
     try:
         loop = _asyncio.get_event_loop()
         log.info("Retrain: fetching 5 months of MEXC data...")
-        data = await loop.run_in_executor(None, lambda: data_fetcher.fetch_all(months=5))
+        data = await _asyncio.wait_for(
+            loop.run_in_executor(None, lambda: data_fetcher.fetch_all(months=5)),
+            timeout=600,
+        )
         log.info("Retrain: building features...")
-        df_feat = await loop.run_in_executor(
-            None, lambda: feat_eng.build_features(
-                data["df5"], data["df15"], data["df1h"], data["funding"], data["cvd"]
-            )
+        df_feat = await _asyncio.wait_for(
+            loop.run_in_executor(
+                None, lambda: feat_eng.build_features(
+                    data["df5"], data["df15"], data["df1h"], data["funding"], data["cvd"]
+                )
+            ),
+            timeout=600,
         )
         log.info("Retrain: training LightGBM (candidate slot)...")
-        result = await loop.run_in_executor(
-            None, lambda: trainer.train(df_feat, slot="candidate")
+        result = await _asyncio.wait_for(
+            loop.run_in_executor(None, lambda: trainer.train(df_feat, slot="candidate")),
+            timeout=600,
         )
         meta = model_store.load_metadata("candidate") or {}
         threshold = result.get("threshold", 0.535)
-        text = format_retrain_complete(meta, threshold)
-        await update.message.reply_text(text, parse_mode="HTML")
-        log.info("Retrain complete. val_wr=%.4f test_wr=%.4f", result.get("val_wr", 0), result["test_metrics"].get("wr", 0))
+        best_iteration = result.get("best_iteration", result.get("best_iter", 0))
+        auc = result.get("auc", result.get("val_auc", meta.get("auc", 0.0)))
+
+        # Persist trained candidate model to DB
+        try:
+            await model_store.save_model_to_db(result["model"], "candidate", meta)
+        except Exception as db_exc:
+            log.warning("Retrain: failed to save candidate to DB: %s", db_exc)
+
+        await notify(
+            f"Retrain complete! Best iteration: {best_iteration}, "
+            f"AUC: {auc:.4f}, Threshold: {threshold:.3f}"
+        )
+        log.info("Retrain complete. val_wr=%.4f", result.get("val_wr", 0))
+
+    except _asyncio.TimeoutError:
+        log.error("Retrain background task timed out after 10 min")
+        await notify("Retrain timed out after 10 min. Try again or check Railway logs.")
     except Exception as exc:
         log.exception("Retrain background task failed: %s", exc)
-        err_text = format_error_alert(f"Retrain failed: {exc}")
-        try:
-            await update.message.reply_text(err_text, parse_mode="HTML")
-        except Exception:
-            pass
+        await notify(f"Retrain failed: {exc}. Check Railway logs.")

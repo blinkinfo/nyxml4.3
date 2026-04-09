@@ -158,6 +158,22 @@ def main() -> None:
         if cleaned:
             log.info("Startup: cleaned %d incorrectly recorded redemption row(s)", cleaned)
         await _startup_safe_sanity_check()
+
+        # Load ML model: try DB first, fall back to disk
+        from core.strategies import ml_strategy
+        from ml import model_store
+        loaded = await model_store.load_model_from_db("current")
+        if loaded:
+            ml_strategy.set_model(loaded)
+            log.info("Startup: ML model loaded from DB")
+        else:
+            disk_model = model_store.load_model("current")
+            if disk_model:
+                ml_strategy.set_model(disk_model)
+                log.info("Startup: ML model loaded from disk (fallback)")
+            else:
+                log.warning("Startup: No ML model found — signals will be skipped until retrain")
+
         start_scheduler(application, poly_client)
         await recover_unresolved()
 

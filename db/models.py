@@ -199,6 +199,16 @@ async def migrate_db(db_path: str | None = None) -> None:
             )
         """)
 
+        # Check and create model_blobs table (DB-persisted model storage)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS model_blobs (
+                slot TEXT PRIMARY KEY,
+                blob BLOB NOT NULL,
+                metadata TEXT,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
         # Seed default ML threshold
         await db.execute(
             "INSERT OR IGNORE INTO ml_config (key, value) VALUES ('ml_threshold', '0.535')"

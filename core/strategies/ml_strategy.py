@@ -67,14 +67,20 @@ class MLStrategy(BaseStrategy):
             log.warning("MLStrategy: funding_buffer seed failed: %s", exc)
 
     def _load_model(self) -> None:
-        """Load the current model from disk."""
-        global _RELOAD_REQUESTED
-        self._model = model_store.load_model("current")
-        _RELOAD_REQUESTED = False
-        if self._model is None:
-            log.warning("MLStrategy: no trained model found at models/model_current.lgb")
+        """Load the current model — use preloaded model if available, else load from disk."""
+        global _RELOAD_REQUESTED, _PRELOADED_MODEL
+        if _PRELOADED_MODEL is not None:
+            self._model = _PRELOADED_MODEL
+            _PRELOADED_MODEL = None
+            _RELOAD_REQUESTED = False
+            log.info("MLStrategy: model set from preloaded instance")
         else:
-            log.info("MLStrategy: model loaded successfully")
+            self._model = model_store.load_model("current")
+            _RELOAD_REQUESTED = False
+            if self._model is None:
+                log.warning("MLStrategy: no trained model found at models/model_current.lgb")
+            else:
+                log.info("MLStrategy: model loaded successfully")
 
     async def _get_threshold(self) -> float:
         """Read threshold from ml_config table, fall back to cfg default."""
