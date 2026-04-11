@@ -370,8 +370,11 @@ def train(df_features: pd.DataFrame, slot: str = "current") -> dict:
         dict with model, threshold, val_wr, val_trades, wf_results, and metadata
     """
     n = len(df_features)
-    if n < 100:
-        raise ValueError(f"Too few samples to train: {n}")
+    # Minimum n is derived from the walk-forward fold skip guard:
+    # fold 1 train = int(int(n*0.60)*0.80) must be >= 50.
+    # Empirically this requires n >= 123; use 130 as a conservative buffer.
+    if n < 130:
+        raise ValueError(f"Too few samples to train: {n} (minimum 130 required)")
 
     X = df_features[FEATURE_COLS].values
     y = df_features["target"].values
