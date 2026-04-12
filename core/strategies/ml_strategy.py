@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections import deque
+from datetime import datetime, timezone
 from typing import Any
 
 import numpy as np
@@ -56,6 +57,12 @@ class MLStrategy(BaseStrategy):
         self._model = None
         self._funding_buffer: deque = deque(maxlen=24)
         self._model_slot = "current"
+        # Track the last funding settlement timestamp that was appended to the
+        # buffer.  MEXC settles funding every 8h (00:00, 08:00, 16:00 UTC).
+        # We only append to the buffer when a new settlement period has started,
+        # matching the training data semantics where each buffer entry represents
+        # one distinct 8h settlement — not a repeated 5m snapshot of the same rate.
+        self._last_funding_settlement: datetime | None = None
         # Each step is individually guarded so a failure in one never prevents
         # the other from running, and a constructor crash can never propagate
         # up to _get_strategy() / the scheduler.
@@ -95,6 +102,19 @@ class MLStrategy(BaseStrategy):
                 log.warning("MLStrategy: could not seed funding_buffer — no historical data returned")
         except Exception as exc:
             log.warning("MLStrategy: funding_buffer seed failed: %s", exc)
+
+    @staticmethod
+    def _current_funding_settlement() -> datetime:
+        """Return the most recent MEXC funding settlement timestamp (UTC).
+
+        MEXC settles funding at 00:00, 08:00, and 16:00 UTC every day.
+        This returns the floor of utcnow() to the nearest 8h boundary,
+        giving a stable, deterministic key for deduplication.
+        """
+        now = datetime.now(timezone.utc)
+        # Hours since midnight, floored to 8h block: 0, 8, or 16
+        settlement_hour = (now.hour // 8) * 8
+        return now.replace(hour=settlement_hour, minute=0, second=0, microsecond=0)
 
     def _load_model(self) -> None:
         """Load the current model — use preloaded model if available, else load from disk."""
@@ -183,7 +203,7 @@ class MLStrategy(BaseStrategy):
         base_fields: dict[str, Any] = {
             "skipped": True,
             "pattern": None,
-            "candles_used": 300,
+            "candles_used": 400,
             "slot_n1_start_full": slot_n1["slot_start_full"],
             "slot_n1_end_full":   slot_n1["slot_end_full"],
             "slot_n1_start_str":  slot_n1["slot_start_str"],
@@ -202,11 +222,11 @@ class MLStrategy(BaseStrategy):
             # Fetch live data in parallel using executor (blocking ccxt calls)
             loop = asyncio.get_running_loop()
             df5, df15, df1h, funding_rate, cvd_live = await asyncio.gather(
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_5m(300)),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_15m(50)),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_1h(30)),
+                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_5m(400)),
+                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_15m(100)),
+                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_1h(60)),
                 loop.run_in_executor(None, data_fetcher.fetch_live_funding),
-                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_cvd(310)),
+                loop.run_in_executor(None, lambda: data_fetcher.fetch_live_cvd(400)),
             )
 
             # Drop the still-forming (last) candle from each OHLCV DataFrame
@@ -216,9 +236,18 @@ class MLStrategy(BaseStrategy):
             df1h = df1h.iloc[:-1].reset_index(drop=True)
             cvd_live = cvd_live.iloc[:-1].reset_index(drop=True) if cvd_live is not None and len(cvd_live) > 0 else cvd_live
 
-            # Update funding rolling buffer
+            # Update funding rolling buffer — only append when a new 8h settlement
+            # has occurred, matching training data semantics (one entry per settlement
+            # period, not one entry per 5m check_signal call).
             if funding_rate is not None:
-                self._funding_buffer.append(funding_rate)
+                current_settlement = self._current_funding_settlement()
+                if self._last_funding_settlement != current_settlement:
+                    self._funding_buffer.append(funding_rate)
+                    self._last_funding_settlement = current_settlement
+                    log.debug(
+                        "MLStrategy: funding_buffer updated for settlement=%s rate=%.6f buffer_len=%d",
+                        current_settlement.isoformat(), funding_rate, len(self._funding_buffer),
+                    )
 
             # Build feature row
             feature_row = feat_eng.build_live_features(

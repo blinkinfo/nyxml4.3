@@ -428,7 +428,7 @@ def fetch_all(months: int = 5) -> dict:
 # Live fetchers (for MLStrategy real-time inference)
 # ---------------------------------------------------------------------------
 
-def fetch_live_5m(limit: int = 50) -> pd.DataFrame:
+def fetch_live_5m(limit: int = 400) -> pd.DataFrame:
     """Fetch last `limit` 5m candles from MEXC spot."""
     exchange = ccxt.mexc()
     ohlcv = exchange.fetch_ohlcv("BTC/USDT", timeframe="5m", limit=limit)
@@ -436,7 +436,7 @@ def fetch_live_5m(limit: int = 50) -> pd.DataFrame:
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-def fetch_live_15m(limit: int = 30) -> pd.DataFrame:
+def fetch_live_15m(limit: int = 100) -> pd.DataFrame:
     """Fetch last `limit` 15m candles from MEXC futures."""
     exchange = ccxt.mexc({"options": {"defaultType": "swap"}})
     ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", timeframe="15m", limit=limit)
@@ -444,7 +444,7 @@ def fetch_live_15m(limit: int = 30) -> pd.DataFrame:
     return df.sort_values("timestamp").reset_index(drop=True)
 
 
-def fetch_live_1h(limit: int = 20) -> pd.DataFrame:
+def fetch_live_1h(limit: int = 60) -> pd.DataFrame:
     """Fetch last `limit` 1h candles from MEXC futures."""
     exchange = ccxt.mexc({"options": {"defaultType": "swap"}})
     ohlcv = exchange.fetch_ohlcv("BTC/USDT:USDT", timeframe="1h", limit=limit)
@@ -488,7 +488,7 @@ def fetch_live_funding_history(n_periods: int = 24) -> list[float]:
         return []
 
 
-def fetch_live_cvd(n_candles: int = 25) -> pd.DataFrame:
+def fetch_live_cvd(n_candles: int = 400) -> pd.DataFrame:
     """Fetch last `n_candles` 5m candles from MEXC futures REST and compute CVD proxy."""
     end_sec = int(time.time())
     # Fetch a bit more to ensure we get n_candles
