@@ -12,126 +12,130 @@ def _e(value: object) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Risk table helpers — module-level so both retrain formatters share them.
-# All formatters produce fixed-width strings for use inside <code> blocks,
-# which Telegram renders in monospace.  Consistent widths keep the │ separator
-# column-aligned regardless of value magnitude.
+# Risk card helper — shared by both retrain formatters.
+#
+# Design: key-value card layout using HTML bold labels and plain values.
+# No <code> block, no monospace padding, no fixed-width columns.
+# This is fully immune to Telegram font scaling on all clients (desktop,
+# iOS, Android).  Val and Test appear inline on each row, clearly labeled.
 # ---------------------------------------------------------------------------
 
-_RISK_VAL_W = 10
+# Thin divider line used between sections (20 em-dashes, renders cleanly
+# in Telegram HTML without any monospace dependency).
+_RISK_DIV = "\u2015" * 18
 
-# Label column width for the risk table (longest label = "Profit factor" = 13 chars,
-# padded to 14 so there is always one space before the value column).
-_RISK_LABEL_W = 14
+
+def _fmt_dd_dollar(v: float) -> str:
+    """Format a drawdown dollar value.  e.g. -11.95 -> '-$11.95'"""
+    if v < 0:
+        return f"-${abs(v):.2f}"
+    return "$0.00"
+
+
+def _fmt_dd_pct(v: float) -> str:
+    """Format a drawdown percentage.  e.g. -1.0 -> '-1.0%'"""
+    if v < 0:
+        return f"{v:.1f}%"
+    return "0.0%"
+
+
+def _fmt_streak(v: int) -> str:
+    return str(int(v))
+
+
+def _fmt_pf(v: float) -> str:
+    return "\u221e" if v == float("inf") else f"{v:.2f}"
+
+
+def _fmt_sharpe(v: float) -> str:
+    return f"{v:.2f}"
+
+
+def _risk_row(label: str, val_str: str, test_str: str | None = None) -> str:
+    """Return one HTML line for a risk metric.
+
+    If test_str is provided:   📌 <b>Label</b>  Val: X  │  Test: Y
+    If test_str is None/empty: 📌 <b>Label</b>  X
+    """
+    if test_str:
+        return f"\U0001f4cc <b>{label}</b>  Val: {val_str}  \u2502  Test: {test_str}\n"
+    return f"\U0001f4cc <b>{label}</b>  {val_str}\n"
 
 
 def _build_risk_table(meta: dict) -> str | None:
-    """Return a fully self-contained <code> risk table for a separate Telegram message.
+    """Return a key-value card risk message for a separate Telegram send.
 
     Returns None when neither val_risk nor test_risk is present in *meta*.
-    The returned string is a standalone HTML snippet — it must be sent with
-    parse_mode='HTML' and requires no surrounding box-drawing characters.
+    The returned string is standalone HTML — send with parse_mode='HTML'.
+
+    Layout (Option 2 — key-value card):
+    ──────────────────
+    ⚠️ Risk Metrics
+    ──────────────────
+    📉 Max Drawdown
+       Val  →  -$18.30  (-195.5%)
+       Test →  -$13.95  (-265.8%)
+    📌 Loss streak   Val: 6  │  Test: 7
+    📌 Win streak    Val: 12 │  Test: 18
+    📌 Profit factor Val: 1.32 │ Test: 1.26
+    📌 Sharpe        Val: 22.92 │ Test: 18.69
+    ──────────────────
+    Walk-Forward (worst)
+    📌 DD $      -$14.69
+    📌 DD %      -280.0%
+    📌 Loss streak   7
     """
     val_risk  = meta.get("val_risk", {})
     test_risk = meta.get("test_risk", {})
     if not val_risk and not test_risk:
         return None
 
-    wf_dd_d   = meta.get("wf_worst_dd_dollar", 0.0)
-    wf_dd_pct = meta.get("wf_worst_dd_pct", 0.0)
-    wf_ls     = meta.get("wf_worst_loss_streak", 0)
+    # ── Drawdown dollar ──────────────────────────────────────────────────
+    v_dd_d = _fmt_dd_dollar(val_risk.get("max_dd_dollar", 0.0))
+    t_dd_d = _fmt_dd_dollar(test_risk.get("max_dd_dollar", 0.0))
+    v_dd_p = _fmt_dd_pct(val_risk.get("max_dd_pct", 0.0))
+    t_dd_p = _fmt_dd_pct(test_risk.get("max_dd_pct", 0.0))
 
-    v_dd_d  = _risk_dd_dollar(val_risk.get("max_dd_dollar", 0.0))
-    t_dd_d  = _risk_dd_dollar(test_risk.get("max_dd_dollar", 0.0))
-    v_dd_p  = _risk_dd_pct(val_risk.get("max_dd_pct", 0.0))
-    t_dd_p  = _risk_dd_pct(test_risk.get("max_dd_pct", 0.0))
-    v_ls    = _risk_streak(val_risk.get("max_loss_streak", 0))
-    t_ls    = _risk_streak(test_risk.get("max_loss_streak", 0))
-    v_ws    = _risk_streak(val_risk.get("max_win_streak", 0))
-    t_ws    = _risk_streak(test_risk.get("max_win_streak", 0))
-    v_pf    = _risk_pf(val_risk.get("profit_factor", 0.0))
-    t_pf    = _risk_pf(test_risk.get("profit_factor", 0.0))
-    v_sh    = _risk_sharpe(val_risk.get("sharpe", 0.0))
-    t_sh    = _risk_sharpe(test_risk.get("sharpe", 0.0))
-    wf_d    = _risk_dd_dollar(wf_dd_d)
-    wf_p    = _risk_dd_pct(wf_dd_pct)
-    wf_ls_s = _risk_streak(wf_ls)
-    blank   = " " * _RISK_VAL_W
+    # ── Other per-split metrics ───────────────────────────────────────────
+    v_ls = _fmt_streak(val_risk.get("max_loss_streak", 0))
+    t_ls = _fmt_streak(test_risk.get("max_loss_streak", 0))
+    v_ws = _fmt_streak(val_risk.get("max_win_streak", 0))
+    t_ws = _fmt_streak(test_risk.get("max_win_streak", 0))
+    v_pf = _fmt_pf(val_risk.get("profit_factor", 0.0))
+    t_pf = _fmt_pf(test_risk.get("profit_factor", 0.0))
+    v_sh = _fmt_sharpe(val_risk.get("sharpe", 0.0))
+    t_sh = _fmt_sharpe(test_risk.get("sharpe", 0.0))
 
-    # Header row — label column + Val + sep + Test, all fixed-width
-    lw = _RISK_LABEL_W
-    hdr_label = "Metric".ljust(lw)
-    hdr_val   = "Val".ljust(_RISK_VAL_W)
-    hdr_test  = "Test".ljust(_RISK_VAL_W)
+    # ── Walk-forward worst-case (top-level keys in meta) ──────────────────
+    wf_dd_d  = meta.get("wf_worst_dd_dollar", 0.0)
+    wf_dd_p  = meta.get("wf_worst_dd_pct", 0.0)
+    wf_ls    = meta.get("wf_worst_loss_streak", 0)
+    has_wf   = any([wf_dd_d, wf_dd_p, wf_ls])
 
-    def row(label: str, val: str, test: str) -> str:
-        return f"{label.ljust(lw)}{val} \u2502 {test}\n"
+    # ── Build message ─────────────────────────────────────────────────────
+    lines: list[str] = [
+        f"\u26a0\ufe0f <b>Risk Metrics</b>\n{_RISK_DIV}\n",
+        # Drawdown — given its two sub-values ($ and %), use a dedicated block
+        (
+            f"\U0001f4c9 <b>Max Drawdown</b>\n"
+            f"   Val  \u2192  {v_dd_d}  ({v_dd_p})\n"
+            f"   Test \u2192  {t_dd_d}  ({t_dd_p})\n"
+        ),
+        _risk_row("Loss streak",   v_ls, t_ls),
+        _risk_row("Win streak",    v_ws, t_ws),
+        _risk_row("Profit factor", v_pf, t_pf),
+        _risk_row("Sharpe",        v_sh, t_sh),
+    ]
 
-    table = (
-        f"{hdr_label}{hdr_val} \u2502 {hdr_test}\n"
-        + "\u2500" * (lw + _RISK_VAL_W + 3 + _RISK_VAL_W) + "\n"
-        + row("Max DD $",      v_dd_d,  t_dd_d)
-        + row("Max DD %",      v_dd_p,  t_dd_p)
-        + row("Loss streak",   v_ls,    t_ls)
-        + row("Win streak",    v_ws,    t_ws)
-        + row("Profit factor", v_pf,    t_pf)
-        + row("Sharpe",        v_sh,    t_sh)
-        + "\u2500" * (lw + _RISK_VAL_W + 3 + _RISK_VAL_W) + "\n"
-        + row("WF worst DD $", wf_d,    blank)
-        + row("WF worst DD %", wf_p,    blank)
-        + f"{'WF loss streak'.ljust(lw)}{wf_ls_s} \u2502 {blank}"
-    )
+    if has_wf:
+        lines += [
+            f"{_RISK_DIV}\n\U0001f6e4 <b>Walk-Forward (worst)</b>\n",
+            _risk_row("DD $",        _fmt_dd_dollar(wf_dd_d)),
+            _risk_row("DD %",        _fmt_dd_pct(wf_dd_p)),
+            _risk_row("Loss streak", _fmt_streak(wf_ls)),
+        ]
 
-    return f"\u26a0\ufe0f <b>Risk Metrics</b>\n<code>{table}</code>"
-
-
-def _risk_dd_dollar(v: float) -> str:
-    """Format a drawdown dollar value to a fixed-width, right-aligned field.
-
-    Examples:  -$3.50  ->  '    -$3.50'   $0.00  ->  '     $0.00'
-    Negative values render as '-$X.XX', zero/positive as '$0.00'.
-    Width is sized for Telegram code-block alignment and larger DD values.
-    """
-    s = f"-${abs(v):.2f}" if v < 0 else "$0.00"
-    return s.rjust(_RISK_VAL_W)
-
-
-def _risk_dd_pct(v: float) -> str:
-    """Format a drawdown percentage to a fixed-width, right-aligned field.
-
-    Examples:  -12.3%  ->  '    -12.3%'   0.0%  ->  '      0.0%'
-    Width is sized for Telegram code-block alignment and large magnitudes.
-    """
-    s = f"{v:.1f}%" if v < 0 else "0.0%"
-    return s.rjust(_RISK_VAL_W)
-
-
-def _risk_streak(v: int) -> str:
-    """Format a streak integer to a fixed-width, right-aligned field.
-
-    All risk value helpers share the same width so the │ separator stays
-    aligned across all risk table rows in Telegram monospace rendering.
-
-    Examples:  7  ->  '         7'   12  ->  '        12'
-    """
-    return str(v).rjust(_RISK_VAL_W)
-
-
-def _risk_pf(v: float) -> str:
-    """Format a profit factor to a fixed-width, right-aligned field.
-
-    Examples:  1.23  ->  '      1.23'   inf  ->  '         ∞'
-    """
-    s = "\u221e" if v == float("inf") else f"{v:.2f}"
-    return s.rjust(_RISK_VAL_W)
-
-
-def _risk_sharpe(v: float) -> str:
-    """Format a Sharpe ratio to a fixed-width, right-aligned field.
-
-    Examples:  1.23  ->  '      1.23'   -0.45  ->  '     -0.45'
-    """
-    return f"{v:.2f}".rjust(_RISK_VAL_W)
+    return "".join(lines).rstrip()
 
 
 # ---------------------------------------------------------------------------
