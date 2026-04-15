@@ -517,14 +517,192 @@ def fetch_cvd(start_ms: int, end_ms: int) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Section 3.6 — Gate.io CVD (taker buy/sell volume)
+# ---------------------------------------------------------------------------
+
+GATE_CONTRACT_STATS_URL = "https://api.gateio.ws/api/v4/futures/usdt/contract_stats"
+_GATE_CONTRACT = "BTC_USDT"
+_GATE_MAX_LIMIT = 2000  # Gate allows up to 2000 rows per request
+
+
+def fetch_gate_cvd(start_ms: int, end_ms: int) -> pd.DataFrame:
+    """Fetch BTC/USDT 5m taker buy/sell volume from Gate.io contract_stats.
+
+    Gate.io /futures/usdt/contract_stats returns per-candle aggregate stats
+    including long_taker_size (aggressive buy volume) and short_taker_size
+    (aggressive sell volume) — real exchange-reported taker flow, no estimation.
+
+    Gate timestamps are in SECONDS; we convert to ms for alignment with MEXC.
+    Paginates forward from start_ms to end_ms in chunks of _GATE_MAX_LIMIT candles.
+
+    Args:
+        start_ms: Start of range in milliseconds UTC (inclusive).
+        end_ms:   End of range in milliseconds UTC (exclusive).
+
+    Returns:
+        DataFrame with columns:
+            timestamp         (datetime64[ms, UTC]) — 5m bucket open time
+            long_taker_size   (float) — aggressive buy volume (contracts)
+            short_taker_size  (float) — aggressive sell volume (contracts)
+        Sorted ascending by timestamp, deduplicated, filtered to [start_ms, end_ms).
+        Returns empty DataFrame with correct columns on any hard failure.
+    """
+    _EMPTY = pd.DataFrame(columns=["timestamp", "long_taker_size", "short_taker_size"])
+
+    # Gate uses seconds; convert ms → s for params
+    start_sec = start_ms // 1000
+    end_sec = end_ms // 1000
+    step_sec = _GATE_MAX_LIMIT * 300  # 2000 bars * 5 min = 10000 min = 600 000 s
+
+    records: list[dict] = []
+    cursor = start_sec
+
+    log.info(
+        "fetch_gate_cvd: fetching BTC_USDT 5m taker volume from Gate.io "
+        "(start=%d, end=%d)", start_ms, end_ms,
+    )
+
+    with httpx.Client(timeout=30) as client:
+        while cursor < end_sec:
+            batch_end = min(cursor + step_sec, end_sec)
+            params = {
+                "contract": _GATE_CONTRACT,
+                "interval": "5m",
+                "from": cursor,
+                "to": batch_end,
+                "limit": _GATE_MAX_LIMIT,
+            }
+            try:
+                resp = client.get(GATE_CONTRACT_STATS_URL, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+            except Exception as exc:
+                log.warning(
+                    "fetch_gate_cvd: request error at cursor=%d: %s", cursor, exc
+                )
+                break
+
+            if not isinstance(data, list) or not data:
+                log.info(
+                    "fetch_gate_cvd: empty response at cursor=%d — stopping", cursor
+                )
+                break
+
+            for row in data:
+                try:
+                    ts_sec = int(row["time"])
+                    lts = float(row.get("long_taker_size", 0) or 0)
+                    sts = float(row.get("short_taker_size", 0) or 0)
+                    records.append({
+                        # Convert Gate seconds → ms for parity with all other DFs
+                        "timestamp": pd.Timestamp(ts_sec * 1000, unit="ms", tz="UTC"),
+                        "long_taker_size": lts,
+                        "short_taker_size": sts,
+                    })
+                except (KeyError, TypeError, ValueError) as exc:
+                    log.debug("fetch_gate_cvd: skipping malformed row: %s — %s", row, exc)
+                    continue
+
+            # Advance cursor past the last returned timestamp
+            last_ts_sec = int(data[-1]["time"])
+            if last_ts_sec >= end_sec or len(data) < _GATE_MAX_LIMIT:
+                break  # reached end or partial page
+            cursor = last_ts_sec + 300  # step one 5m bar forward
+            time.sleep(0.1)
+
+    log.info("fetch_gate_cvd: fetched %d raw candles total", len(records))
+
+    if not records:
+        log.warning("fetch_gate_cvd: no data returned for window [%d, %d)", start_ms, end_ms)
+        return _EMPTY
+
+    df = pd.DataFrame(records)
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+
+    # Filter to requested range
+    start_dt = pd.Timestamp(start_ms, unit="ms", tz="UTC")
+    end_dt = pd.Timestamp(end_ms, unit="ms", tz="UTC")
+    df = df[(df["timestamp"] >= start_dt) & (df["timestamp"] < end_dt)].reset_index(drop=True)
+
+    log.info(
+        "fetch_gate_cvd: returning %d candles after range filter "
+        "(%s → %s)",
+        len(df),
+        df["timestamp"].iloc[0].isoformat() if len(df) > 0 else "N/A",
+        df["timestamp"].iloc[-1].isoformat() if len(df) > 0 else "N/A",
+    )
+    return df
+
+
+def fetch_live_gate_cvd(limit: int = 400) -> pd.DataFrame:
+    """Fetch the most recent `limit` 5m Gate.io CVD candles for live inference.
+
+    Uses the `limit` parameter directly (no from/to pagination needed for
+    recent data). Gate returns results in ascending timestamp order.
+
+    Args:
+        limit: Number of 5m candles to fetch (default 400, max 2000).
+
+    Returns:
+        DataFrame with columns: timestamp, long_taker_size, short_taker_size
+        Sorted ascending. Returns empty DataFrame on failure.
+    """
+    _EMPTY = pd.DataFrame(columns=["timestamp", "long_taker_size", "short_taker_size"])
+
+    params = {
+        "contract": _GATE_CONTRACT,
+        "interval": "5m",
+        "limit": min(limit, _GATE_MAX_LIMIT),
+    }
+    log.info("fetch_live_gate_cvd: fetching last %d 5m candles from Gate.io", limit)
+
+    try:
+        with httpx.Client(timeout=15) as client:
+            resp = client.get(GATE_CONTRACT_STATS_URL, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+    except Exception as exc:
+        log.warning("fetch_live_gate_cvd: request error: %s", exc)
+        return _EMPTY
+
+    if not isinstance(data, list) or not data:
+        log.warning("fetch_live_gate_cvd: empty response from Gate.io")
+        return _EMPTY
+
+    records = []
+    for row in data:
+        try:
+            ts_sec = int(row["time"])
+            lts = float(row.get("long_taker_size", 0) or 0)
+            sts = float(row.get("short_taker_size", 0) or 0)
+            records.append({
+                "timestamp": pd.Timestamp(ts_sec * 1000, unit="ms", tz="UTC"),
+                "long_taker_size": lts,
+                "short_taker_size": sts,
+            })
+        except (KeyError, TypeError, ValueError) as exc:
+            log.debug("fetch_live_gate_cvd: skipping malformed row: %s — %s", row, exc)
+            continue
+
+    if not records:
+        log.warning("fetch_live_gate_cvd: no valid records parsed from response")
+        return _EMPTY
+
+    df = pd.DataFrame(records)
+    df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    log.info("fetch_live_gate_cvd: returning %d candles", len(df))
+    return df
+
+
+# ---------------------------------------------------------------------------
 # fetch_all — fetch last N months of all 5 sources
 # ---------------------------------------------------------------------------
 
 def fetch_all(months: int = 5) -> dict:
-    """Fetch all 4 data sources for the last `months` months.
+    """Fetch all 5 data sources for the last `months` months.
 
-    Returns dict with keys: df5, df15, df1h, funding
-    (CVD removed — pressure features now derived from OHLCV only)
+    Returns dict with keys: df5, df15, df1h, funding, cvd
+      cvd — Gate.io 5m taker buy/sell volume (long_taker_size, short_taker_size)
     """
     now = datetime.now(timezone.utc)
     start = now - timedelta(days=months * 30)
@@ -549,7 +727,11 @@ def fetch_all(months: int = 5) -> dict:
     funding = fetch_funding(start_ms, end_ms)
     print(f"  -> {len(funding)} funding records")
 
-    return {"df5": df5, "df15": df15, "df1h": df1h, "funding": funding}
+    print("  Fetching Gate.io CVD (taker buy/sell volume)...")
+    cvd = fetch_gate_cvd(start_ms, end_ms)
+    print(f"  -> {len(cvd)} CVD candles")
+
+    return {"df5": df5, "df15": df15, "df1h": df1h, "funding": funding, "cvd": cvd}
 
 
 # ---------------------------------------------------------------------------

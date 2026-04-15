@@ -7,10 +7,11 @@ Target semantics: 1 if the NEXT candle closes at or above its own open
 (close[i+1] >= open[i+1]), matching Polymarket's settlement logic
 (resolver.py: winner = "Up" if close_price >= open_price else "Down").
 
-36 features total: candle shape (7), volume (2), 15m context (3), 1h context (3),
+37 features total: candle shape (7), volume (2), 15m context (3), 1h context (3),
 funding (2), OHLCV pressure (5), time-of-day cyclical (4), volatility regime (2),
 momentum (4: rsi14, candle_streak, price_in_range, ema_cross_5m),
-structure (4: mtf_alignment, body_vs_range5, range_expansion, vwap_dist_20).
+structure (3: body_vs_range5, range_expansion, vwap_dist_20),
+Gate.io CVD taker flow (2: cvd_ratio, cvd_delta_norm).
 """
 
 from __future__ import annotations
@@ -24,7 +25,7 @@ import pandas as pd
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Feature column order — MUST match exactly (36 features)
+# Feature column order — MUST match exactly (35 features)
 # ---------------------------------------------------------------------------
 FEATURE_COLS = [
     "body_ratio_n1", "body_ratio_n2", "body_ratio_n3",
@@ -39,7 +40,9 @@ FEATURE_COLS = [
     "atr_percentile_24h", "vol_regime",
     "rsi14", "candle_streak", "price_in_range", "ema_cross_5m",  # momentum features
     # structure features
-    "mtf_alignment", "body_vs_range5", "range_expansion", "vwap_dist_20",
+    "body_vs_range5", "range_expansion", "vwap_dist_20",
+    # Gate.io CVD taker flow features (indices 35, 36)
+    "cvd_ratio", "cvd_delta_norm",
 ]
 
 
@@ -119,8 +122,19 @@ def build_features(
     df15: pd.DataFrame,
     df1h: pd.DataFrame,
     funding: pd.DataFrame,
+    cvd: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
-    """Build 36 features per BLUEPRINT sections 4-6. Returns df with FEATURE_COLS + 'target'."""
+    """Build 37 features per BLUEPRINT sections 4-6. Returns df with FEATURE_COLS + 'target'.
+
+    Args:
+        df5:     5m OHLCV candles from MEXC spot.
+        df15:    15m OHLCV candles from MEXC futures.
+        df1h:    1h OHLCV candles from MEXC futures.
+        funding: Funding rate history from MEXC futures.
+        cvd:     Gate.io 5m taker volume (long_taker_size, short_taker_size).
+                 If None or empty, cvd_ratio defaults to 0.5 and cvd_delta_norm
+                 to 0.0 (neutral — no directional information available).
+    """
 
     # Work on copies with clean RangeIndex
     df5 = df5.copy().reset_index(drop=True)
@@ -314,12 +328,6 @@ def build_features(
     # Structure features — all use shift(k>=1) for zero lookahead
     # -----------------------------------------------------------------------
 
-    # mtf_alignment: product of N-1 5m body direction * 15m dir * 1h dir.
-    # All three inputs are already shift(1)-based (body_ratio_n1 uses shift(1),
-    # dir_15m/dir_1h are asof-merged against ts_n1 = timestamp.shift(1)).
-    # Result: +1 = all three TFs aligned, -1 = alternating, 0 = any flat.
-    df5["mtf_alignment"] = np.sign(df5["body_ratio_n1"]) * df5["dir_15m"] * df5["dir_1h"]
-
     # body_vs_range5: |body_n1| normalised by the 5-candle range ending at N-1.
     # 5-bar range = max(high[i-1..i-5]) - min(low[i-1..i-5]) — shift(1).rolling(5)
     # gives exactly that window at each row i with zero lookahead.
@@ -342,6 +350,50 @@ def build_features(
     _v_20   = df5["volume"].shift(1).rolling(20, min_periods=5).sum().clip(lower=1e-9)
     _vwap20 = _cv_20 / _v_20
     df5["vwap_dist_20"] = (df5["close"].shift(1) - _vwap20) / atr5.shift(1).clip(lower=1e-9)
+
+    # -----------------------------------------------------------------------
+    # Gate.io CVD taker flow features — merge_asof backward on ts_n1
+    #
+    # cvd_ratio     : long_taker_size / total_taker_size — [0, 1]
+    #                 > 0.5 = net buy pressure, < 0.5 = net sell pressure.
+    #                 Neutral default 0.5 when no CVD data is available.
+    #
+    # cvd_delta_norm: (long_taker_size - short_taker_size) / atr5 — signed,
+    #                 ATR-normalized bar delta. Positive = buy dominance.
+    #                 Neutral default 0.0 when no CVD data is available.
+    #
+    # Both use ts_n1 (N-1 candle timestamp) in the merge — zero lookahead.
+    # -----------------------------------------------------------------------
+    cvd_available = (
+        cvd is not None
+        and not cvd.empty
+        and "long_taker_size" in cvd.columns
+        and "short_taker_size" in cvd.columns
+    )
+
+    if cvd_available:
+        cvd_clean = cvd.copy().reset_index(drop=True)
+        cvd_clean["timestamp"] = cvd_clean["timestamp"].astype("datetime64[ms, UTC]")
+        cvd_clean = cvd_clean.sort_values("timestamp").reset_index(drop=True)
+
+        # Derive ratio and delta directly on the CVD frame before merging
+        _total = (cvd_clean["long_taker_size"] + cvd_clean["short_taker_size"]).clip(lower=1e-9)
+        cvd_clean["cvd_ratio"] = (cvd_clean["long_taker_size"] / _total).clip(0.0, 1.0)
+        cvd_clean["cvd_delta"] = cvd_clean["long_taker_size"] - cvd_clean["short_taker_size"]
+
+        rcvd = _asof_backward(ts_n1, cvd_clean, ["cvd_ratio", "cvd_delta"])
+        df5["cvd_ratio"] = rcvd["cvd_ratio"].values
+
+        # Normalize delta by ATR — use atr5 (already computed on df5)
+        # Clip denominator away from zero to prevent inf/nan
+        df5["cvd_delta_norm"] = rcvd["cvd_delta"].values / atr5.shift(1).clip(lower=1e-9).values
+    else:
+        log.warning(
+            "build_features: CVD data not provided or empty — "
+            "using neutral defaults (cvd_ratio=0.5, cvd_delta_norm=0.0)"
+        )
+        df5["cvd_ratio"] = 0.5
+        df5["cvd_delta_norm"] = 0.0
 
     # -----------------------------------------------------------------------
     # Target: 1 if next candle closes >= its own open (future label, NOT a feature)
@@ -369,12 +421,13 @@ def build_live_features(
     df1h_live: pd.DataFrame,
     funding_rate_float: float | None,
     funding_buffer: deque,
+    cvd_live: pd.DataFrame | None = None,
 ) -> "tuple[np.ndarray, list[str]] | tuple[None, list[str]]":
     """
-    Build a single feature row (shape 1×36) for live inference.
+    Build a single feature row (shape 1×37) for live inference.
 
     Returns a 2-tuple (feature_row, nan_features):
-      - feature_row : np.ndarray shape (1, 36), or None on hard failure.
+      - feature_row : np.ndarray shape (1, 37), or None on hard failure.
       - nan_features: list of feature names that were NaN (empty on success).
                       Populated even when feature_row is None so callers can
                       log exactly which features caused the skip.
@@ -382,6 +435,17 @@ def build_live_features(
     Returns (None, []) if ATR warmup is not satisfied (fewer than 14 candles).
     Returns (None, [<name>, ...]) when one or more features are NaN.
     Returns (row, []) on full success.
+
+    Args:
+        df5_live:           5m OHLCV candles (live window).
+        df15_live:          15m OHLCV candles (live window).
+        df1h_live:          1h OHLCV candles (live window).
+        funding_rate_float: Most recent funding rate float.
+        funding_buffer:     Rolling deque of recent funding rates.
+        cvd_live:           Gate.io 5m taker volume DataFrame
+                            (columns: timestamp, long_taker_size, short_taker_size).
+                            If None or empty, cvd_ratio defaults to 0.5 and
+                            cvd_delta_norm to 0.0 (neutral — no bias applied).
     """
     # Validate ATR warmup
     if len(df5_live) < 14:
@@ -673,11 +737,6 @@ def build_live_features(
     # Structure features (live) — mirrors build_features() formulas exactly
     # -----------------------------------------------------------------------
 
-    # mtf_alignment (live): sign(body_ratio_n1) * dir_15m * dir_1h
-    mtf_alignment = float(np.sign(body_ratio_n1) * dir_15m * dir_1h) if not (
-        np.isnan(body_ratio_n1) or np.isnan(dir_15m) or np.isnan(dir_1h)
-    ) else np.nan
-
     # body_vs_range5 (live): |body_n1| / 5-bar range ending at N-1
     # Window: high/low of last 5 closed candles = indices [-6:-1]
     _n5_high = high_arr[max(0, len(high_arr)-6):-1]  # up to 5 values ending at N-1
@@ -716,6 +775,54 @@ def build_live_features(
     else:
         vwap_dist_20 = np.nan
 
+    # -----------------------------------------------------------------------
+    # Gate.io CVD taker flow features (live)
+    #
+    # Mirrors build_features() exactly:
+    #   cvd_ratio     = long_taker_size / (long + short), clamped [0, 1]
+    #   cvd_delta_norm = (long - short) / atr5_val  (ATR-normalized)
+    #
+    # We look up the last CVD candle whose timestamp <= ts_n1_live (N-1 bar).
+    # This is identical to the merge_asof backward join used in training.
+    # -----------------------------------------------------------------------
+    cvd_live_available = (
+        cvd_live is not None
+        and not cvd_live.empty
+        and "long_taker_size" in cvd_live.columns
+        and "short_taker_size" in cvd_live.columns
+    )
+
+    if cvd_live_available:
+        ts_n1_for_cvd = df5["timestamp"].iloc[-2] if len(df5) >= 2 else None
+        if ts_n1_for_cvd is not None and not pd.isna(ts_n1_for_cvd):
+            _cvd_ts = pd.to_datetime(cvd_live["timestamp"], utc=True).astype("datetime64[ms, UTC]")
+            _mask_cvd = _cvd_ts <= pd.Timestamp(ts_n1_for_cvd)
+            if _mask_cvd.any():
+                _cvd_row = cvd_live[_mask_cvd].iloc[-1]
+                _lts = float(_cvd_row.get("long_taker_size", 0) or 0)
+                _sts = float(_cvd_row.get("short_taker_size", 0) or 0)
+                _total = max(_lts + _sts, 1e-9)
+                cvd_ratio_live = float(np.clip(_lts / _total, 0.0, 1.0))
+                _delta = _lts - _sts
+                cvd_delta_norm_live = float(_delta / max(atr5_val, 1e-9))
+            else:
+                log.debug(
+                    "build_live_features: no CVD candle at or before ts_n1=%s — using neutrals",
+                    ts_n1_for_cvd,
+                )
+                cvd_ratio_live = 0.5
+                cvd_delta_norm_live = 0.0
+        else:
+            cvd_ratio_live = 0.5
+            cvd_delta_norm_live = 0.0
+    else:
+        log.debug(
+            "build_live_features: cvd_live not provided or empty — "
+            "using neutral defaults (cvd_ratio=0.5, cvd_delta_norm=0.0)"
+        )
+        cvd_ratio_live = 0.5
+        cvd_delta_norm_live = 0.0
+
     row = np.array([[
         body_ratio_n1, body_ratio_n2, body_ratio_n3,
         upper_wick_n1, upper_wick_n2,
@@ -728,7 +835,8 @@ def build_live_features(
         hour_sin, hour_cos, dow_sin, dow_cos,
         atr_percentile_24h, vol_regime,
         rsi14, candle_streak, price_in_range, ema_cross_5m,
-        mtf_alignment, body_vs_range5, range_expansion, vwap_dist_20,
+        body_vs_range5, range_expansion, vwap_dist_20,
+        cvd_ratio_live, cvd_delta_norm_live,
     ]], dtype=np.float64)
 
     nan_features = [FEATURE_COLS[i] for i in range(len(FEATURE_COLS)) if np.isnan(row[0][i])]

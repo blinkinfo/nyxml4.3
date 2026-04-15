@@ -19,7 +19,7 @@ def make_ohlcv(n=100, seed=42):
 
 
 def test_feature_count():
-    assert len(FEATURE_COLS) == 36
+    assert len(FEATURE_COLS) == 37
 
 
 def test_feature_order():
@@ -33,7 +33,8 @@ def test_feature_order():
                 'hour_sin', 'hour_cos', 'dow_sin', 'dow_cos',
                 'atr_percentile_24h', 'vol_regime',
                 'rsi14', 'candle_streak', 'price_in_range', 'ema_cross_5m',
-                'mtf_alignment', 'body_vs_range5', 'range_expansion', 'vwap_dist_20']
+                'body_vs_range5', 'range_expansion', 'vwap_dist_20',
+                'cvd_ratio', 'cvd_delta_norm']
     assert FEATURE_COLS == expected
 
 
@@ -432,10 +433,10 @@ def make_aligned_data(n=500, seed=99):
     return df5, df15, df1h, funding, funding_buf, funding_rate
 
 
-def test_mtf_alignment_parity():
-    """mtf_alignment = sign(body_ratio_n1) * dir_15m * dir_1h.
-    Training: uses already-computed body_ratio_n1, dir_15m, dir_1h columns.
-    Live:     same formula on scalar values.
+def test_cvd_ratio_parity():
+    """cvd_ratio = long_taker_size / (long + short), in [0, 1].
+    Training: build_features() with explicit CVD DataFrame.
+    Live:     build_live_features() with the same CVD DataFrame.
     Both must equal the hand-computed reference AND each other.
     """
     from collections import deque
@@ -443,31 +444,35 @@ def test_mtf_alignment_parity():
 
     df5, df15, df1h, funding, fbuf, fr = make_aligned_data(seed=11)
 
-    train_feat = build_features(df5, df15, df1h, funding)
+    # Build a synthetic CVD DataFrame aligned with df5 timestamps
+    rng = np.random.default_rng(42)
+    cvd_ts = df5["timestamp"].copy()
+    long_vol = rng.uniform(100, 1000, len(cvd_ts))
+    short_vol = rng.uniform(100, 1000, len(cvd_ts))
+    cvd = pd.DataFrame({
+        "timestamp": cvd_ts,
+        "long_taker_size": long_vol,
+        "short_taker_size": short_vol,
+    })
+
+    train_feat = build_features(df5, df15, df1h, funding, cvd)
     live_row, nan_feats = build_live_features(
-        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf)
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf, cvd.copy())
 
     assert live_row is not None, f"live returned None; nan={nan_feats}"
+    assert nan_feats == [], f"Unexpected NaN features: {nan_feats}"
 
-    idx = FEATURE_COLS.index("mtf_alignment")
-    train_val = float(train_feat["mtf_alignment"].iloc[-2])
-    live_val  = float(live_row[0][idx])
+    idx_ratio = FEATURE_COLS.index("cvd_ratio")
+    train_val = float(train_feat["cvd_ratio"].iloc[-2])
+    live_val  = float(live_row[0][idx_ratio])
 
-    # Verify value is in {-1, 0, 1}
-    assert train_val in (-1.0, 0.0, 1.0), f"train mtf_alignment={train_val} not in {{-1,0,1}}"
-    assert live_val  in (-1.0, 0.0, 1.0), f"live  mtf_alignment={live_val}  not in {{-1,0,1}}"
+    # Value must be in [0, 1]
+    assert 0.0 <= train_val <= 1.0, f"train cvd_ratio={train_val} out of [0,1]"
+    assert 0.0 <= live_val  <= 1.0, f"live  cvd_ratio={live_val} out of [0,1]"
 
-    # Training and live must match
-    np.testing.assert_allclose(live_val, train_val, atol=1e-12,
-        err_msg=f"mtf_alignment mismatch: train={train_val} live={live_val}")
-
-    # Hand-verify: sign(body_ratio_n1) * dir_15m * dir_1h
-    br_n1  = float(train_feat["body_ratio_n1"].iloc[-2])
-    dir15  = float(train_feat["dir_15m"].iloc[-2])
-    dir1h  = float(train_feat["dir_1h"].iloc[-2])
-    ref = np.sign(br_n1) * dir15 * dir1h
-    np.testing.assert_allclose(train_val, ref, atol=1e-12,
-        err_msg=f"mtf_alignment hand-ref mismatch: computed={train_val} ref={ref}")
+    # Training and live must match to floating-point precision
+    np.testing.assert_allclose(live_val, train_val, atol=1e-9,
+        err_msg=f"cvd_ratio mismatch: train={train_val} live={live_val}")
 
 
 def test_body_vs_range5_parity():
@@ -619,14 +624,16 @@ def test_vwap_dist_20_parity():
 
 
 def test_structure_features_no_nan_in_normal_conditions():
-    """All 4 structure features must be non-NaN when data is plentiful and well-formed."""
+    """All structure + CVD features must be non-NaN when data is plentiful and well-formed."""
     from collections import deque
     from ml.features import build_features, build_live_features, FEATURE_COLS
 
     df5, df15, df1h, funding, fbuf, fr = make_aligned_data(n=500, seed=55)
+    # CVD defaults to neutral (0.5 / 0.0) when not provided — still non-NaN
     train_feat = build_features(df5, df15, df1h, funding)
 
-    struct_feats = ["mtf_alignment", "body_vs_range5", "range_expansion", "vwap_dist_20"]
+    struct_feats = ["body_vs_range5", "range_expansion", "vwap_dist_20",
+                    "cvd_ratio", "cvd_delta_norm"]
     for feat in struct_feats:
         nan_count = train_feat[feat].isna().sum()
         total = len(train_feat)
@@ -642,37 +649,41 @@ def test_structure_features_no_nan_in_normal_conditions():
         assert not np.isnan(live_row[0][i]), f"{feat} is NaN in live row with 500 candles"
 
 
-def test_mtf_alignment_all_timeframes_aligned():
-    """When all 3 TFs are bullish, mtf_alignment must be +1.0 exactly."""
+def test_cvd_delta_norm_parity():
+    """cvd_delta_norm = (long - short) / atr5 — ATR-normalized signed delta.
+    Training and live must match each other to floating-point precision.
+    """
     from collections import deque
     from ml.features import build_features, build_live_features, FEATURE_COLS
 
-    # Build data where N-1 candle is strongly bullish on all TFs
-    rng = np.random.default_rng(77)
-    n = 500
-    ts = pd.date_range("2026-01-01", periods=n, freq="5min", tz="UTC")
-    # Strongly trending up
-    close = 50000 + np.cumsum(np.abs(rng.normal(10, 2, n)))
-    open_ = close - np.abs(rng.normal(5, 1, n))  # always close > open (bullish)
-    high  = close + rng.uniform(1, 3, n)
-    low   = open_ - rng.uniform(1, 3, n)
-    vol   = rng.uniform(50, 200, n)
-    df5 = pd.DataFrame({"timestamp": ts, "open": open_, "high": high,
-                        "low": low, "close": close, "volume": vol})
-    s = df5.set_index("timestamp")
-    df15 = s.resample("15min").agg({"open":"first","high":"max","low":"min",
-                                    "close":"last","volume":"sum"}).dropna().reset_index()
-    df1h = s.resample("1h").agg({"open":"first","high":"max","low":"min",
-                                  "close":"last","volume":"sum"}).dropna().reset_index()
-    fts = pd.date_range(ts.min()-pd.Timedelta("16h"), ts.max()+pd.Timedelta("1h"),
-                        freq="8h", tz="UTC")
-    funding = pd.DataFrame({"timestamp": fts,
-                             "funding_rate": rng.normal(0, 0.0001, len(fts))})
-    fbuf = deque(rng.normal(0, 0.0001, 24).tolist(), maxlen=24)
-    fr = float(rng.normal(0, 0.0001))
+    df5, df15, df1h, funding, fbuf, fr = make_aligned_data(seed=77)
 
-    train_feat = build_features(df5, df15, df1h, funding)
-    # In a strongly bullish series, the last few rows should all be +1
-    last_rows = train_feat["mtf_alignment"].dropna().tail(10)
-    assert (last_rows == 1.0).all(), \
-        f"Expected all +1 mtf_alignment in strongly bullish series, got: {last_rows.values}"
+    # Build synthetic CVD data with known buy/sell dominance pattern
+    rng = np.random.default_rng(99)
+    cvd_ts = df5["timestamp"].copy()
+    long_vol = rng.uniform(500, 2000, len(cvd_ts))
+    short_vol = rng.uniform(300, 1800, len(cvd_ts))
+    cvd = pd.DataFrame({
+        "timestamp": cvd_ts,
+        "long_taker_size": long_vol,
+        "short_taker_size": short_vol,
+    })
+
+    train_feat = build_features(df5, df15, df1h, funding, cvd)
+    live_row, nan_feats = build_live_features(
+        df5.iloc[:-1].copy(), df15.copy(), df1h.copy(), fr, fbuf, cvd.copy())
+
+    assert live_row is not None, f"live returned None; nan={nan_feats}"
+    assert nan_feats == [], f"Unexpected NaN features: {nan_feats}"
+
+    idx_norm = FEATURE_COLS.index("cvd_delta_norm")
+    train_val = float(train_feat["cvd_delta_norm"].iloc[-2])
+    live_val  = float(live_row[0][idx_norm])
+
+    # Must be finite
+    assert np.isfinite(train_val), f"train cvd_delta_norm not finite: {train_val}"
+    assert np.isfinite(live_val),  f"live  cvd_delta_norm not finite: {live_val}"
+
+    # Training and live must match
+    np.testing.assert_allclose(live_val, train_val, atol=1e-9,
+        err_msg=f"cvd_delta_norm mismatch: train={train_val} live={live_val}")
