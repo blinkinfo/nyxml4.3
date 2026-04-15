@@ -270,7 +270,12 @@ class MLStrategy(BaseStrategy):
                     import pandas as _pd
                     n1 = df5.iloc[-1]
                     ts_raw = n1["timestamp"]
-                    candle_n1_ts    = str(_pd.Timestamp(ts_raw, unit="ms", tz="UTC").isoformat()) if ts_raw is not None else None
+                    if isinstance(ts_raw, _pd.Timestamp):
+                        candle_n1_ts = str(ts_raw.tz_localize("UTC").isoformat() if ts_raw.tzinfo is None else ts_raw.isoformat())
+                    elif ts_raw is not None:
+                        candle_n1_ts = str(_pd.Timestamp(int(ts_raw), unit="ms", tz="UTC").isoformat())
+                    else:
+                        candle_n1_ts = None
                     candle_n1_close = float(n1["close"])
                     candle_n1_vol   = float(n1["volume"])
                 except Exception as _e:
